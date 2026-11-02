@@ -1,0 +1,411 @@
+openapi: 3.0.3
+info:
+  title: AI Allowance Wallet API
+  version: 0.1.0
+  description: |
+    CONTRACT RULE: do not change this file without telling the whole team.
+
+    Conventions
+    - Money is a string with 2 decimals ("0.05", "9.99") plus a currency code (USD only).
+    - Timestamps are ISO 8601 UTC. IDs are prefixed: txn_, pln_, stp_.
+    - One demo user, no login. One base URL; the backend serves everything (the agent service sits behind it).
+
+    Policy evaluation order (backend implements, same order every time)
+    1. amount > per_action_cap                      -> BLOCK   (rule: per_action_cap)
+    2. amount > available balance                   -> BLOCK   (rule: insufficient_funds)
+    3. spent_today + amount > daily_cap             -> BLOCK   (rule: daily_cap)
+    4. spent_month + amount > monthly_budget        -> BLOCK   (rule: monthly_budget)
+    5. amount > approval_threshold                  -> REQUIRE_APPROVAL (rule: approval_threshold)
+    6. otherwise                                    -> ALLOW   (rule: none)
+
+    What counts as spent
+    - spent_today and spent_month count APPROVED and SETTLED transactions. PENDING_APPROVAL does not count until a human approves it.
+    - Approving re-runs rules 1-4 against the current totals (rule 5 is skipped, a human just decided). If a rule now fails the transaction becomes BLOCKED and nothing moves.
+
+    Merchants
+    - subscription purchases use a platform name from /catalog. Other categories use a merchant name from /merchants. Unknown merchants get 422 unknown_merchant.
+
+    Transaction lifecycle
+    - ALLOW + settlement "immediate"  : APPROVED -> SETTLED (PayPal Payout, or ledger-only fallback)
+    - ALLOW + settlement "batched"    : APPROVED (ledgered) -> SETTLED when POST /settlement/run is called
+    - REQUIRE_APPROVAL                : PENDING_APPROVAL -> (user approves, rules 1-4 re-checked) APPROVED -> SETTLED, or BLOCKED if the re-check fails, or REJECTED
+    - BLOCK                           : BLOCKED (logged, nothing moves)
+    - PayPal call fails               : FAILED
+
+    Settlement rule: category "subscription" settles "immediate". Categories "api_call", "compute", "dataset" settle "batched".
+servers:
+  - url: http://localhost:8000
+paths:
+  /wallet:
+    get:
+      summary: Wallet balance and spend so far
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wallet" }
+  /wallet/fund:
+    post:
+      summary: Start a top-up. Creates a PayPal sandbox Order (Orders API).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: string, example: "20.00" }
+      responses:
+        "201":
+          description: Order created. User approves at approve_url with a sandbox personal account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FundOrder" }
+  /wallet/fund/{orderId}/capture:
+    post:
+      summary: Capture the approved Order and credit the wallet
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Wallet after top-up
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wallet" }
+        "409": { $ref: "#/components/responses/Error" }
+  /policy:
+    get:
+      summary: Get spending policy
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+    put:
+      summary: Replace spending policy
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Policy" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+  /budget:
+    get:
+      summary: What can be spent right now (used by the check_budget MCP tool)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Budget" }
+  /purchase-request:
+    post:
+      summary: Ask to spend money (used by the request_purchase MCP tool and by the timeline). Runs the policy engine, and settles if allowed.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PurchaseRequest" }
+      responses:
+        "201":
+          description: Transaction with the policy decision. Check decision.decision and status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "422": { $ref: "#/components/responses/Error" }
+  /transactions:
+    get:
+      summary: Audit log, newest first
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string } }
+        - { name: requester, in: query, required: false, schema: { type: string, enum: [user, agent, timeline] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Transaction" }
+  /transactions/{txnId}/approve:
+    post:
+      summary: Human approves a PENDING_APPROVAL transaction. Triggers settlement. Dashboard only, never the agent.
+      parameters:
+        - { $ref: "#/components/parameters/txnId" }
+      responses:
+        "200":
+          description: Updated transaction
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "409": { $ref: "#/components/responses/Error" }
+  /transactions/{txnId}/reject:
+    post:
+      summary: Human rejects a PENDING_APPROVAL transaction
+      parameters:
+        - { $ref: "#/components/parameters/txnId" }
+      responses:
+        "200":
+          description: Updated transaction
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "409": { $ref: "#/components/responses/Error" }
+  /settlement/run:
+    post:
+      summary: Settle all APPROVED batched transactions in one PayPal Payout (end-of-day batch). Demo button.
+      responses:
+        "200":
+          description: Batch result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SettlementBatch" }
+  /catalog:
+    get:
+      summary: Fixed catalog of fictional platforms and titles
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Platform" }
+  /merchants:
+    get:
+      summary: Fixed list of fictional merchants agents may buy from. The agent service reads this at startup and puts it in the agent's prompt.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Merchant" }
+  /plan:
+    post:
+      summary: AI builds a month-by-month subscription timeline from a typed list of titles
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [titles]
+              properties:
+                titles:
+                  type: array
+                  items: { type: string }
+                  example: [Series A, Series B, Movie C]
+      responses:
+        "201":
+          description: Plan
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Plan" }
+        "422": { $ref: "#/components/responses/Error" }
+    get:
+      summary: Latest plan
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Plan" }
+        "404": { $ref: "#/components/responses/Error" }
+  /plan/{planId}/steps/{stepId}/pay:
+    post:
+      summary: Timeline says it is time to pay for this step. Creates a purchase request (requester "timeline") through the policy engine.
+      parameters:
+        - { name: planId, in: path, required: true, schema: { type: string } }
+        - { name: stepId, in: path, required: true, schema: { type: string } }
+      responses:
+        "201":
+          description: Transaction for this step
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+  /plan/{planId}/steps/{stepId}/skip:
+    post:
+      summary: User skips a step (watched it elsewhere, changed their mind). Sets the step to SKIPPED, no payment.
+      parameters:
+        - { name: planId, in: path, required: true, schema: { type: string } }
+        - { name: stepId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Updated plan
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Plan" }
+        "409": { $ref: "#/components/responses/Error" }
+  /demo/reset:
+    post:
+      summary: Wipe everything and re-seed (policy, wallet pre-set to 20.00 by the reset itself with NO PayPal Order, empty log). For the video and judges' first run. Real top-ups still go through /wallet/fund.
+      responses:
+        "200":
+          description: Fresh wallet
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wallet" }
+  /webhooks/paypal:
+    post:
+      summary: PayPal sandbox webhook receiver. OPTIONAL. PayPal cannot reach localhost, so this only works after the hosted deploy. The app must work without it.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: Received }
+components:
+  parameters:
+    txnId: { name: txnId, in: path, required: true, schema: { type: string } }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string, example: invalid_state }
+        message: { type: string, example: Transaction txn_001 is not pending approval }
+    Wallet:
+      type: object
+      properties:
+        currency: { type: string, example: USD }
+        balance: { type: string, example: "20.00", description: "Funded money in the wallet (from a captured Order, or pre-set by /demo/reset)" }
+        reserved: { type: string, example: "0.05", description: APPROVED but not yet settled (batched micro-purchases) }
+        available: { type: string, example: "19.95", description: balance minus reserved }
+        spent_today: { type: string, example: "0.00" }
+        spent_month: { type: string, example: "0.00" }
+        settlement_mode: { type: string, enum: [payouts, ledger_only], example: payouts }
+    FundOrder:
+      type: object
+      properties:
+        order_id: { type: string, example: 5O190127TN364715T }
+        status: { type: string, example: CREATED }
+        approve_url: { type: string, example: "https://www.sandbox.paypal.com/checkoutnow?token=5O190127TN364715T" }
+    Policy:
+      type: object
+      properties:
+        monthly_budget: { type: string, example: "30.00" }
+        daily_cap: { type: string, example: "15.00" }
+        per_action_cap: { type: string, example: "12.00" }
+        approval_threshold: { type: string, example: "5.00", description: Above this, a human must approve }
+    Budget:
+      type: object
+      properties:
+        available: { type: string, example: "19.95" }
+        remaining_today: { type: string, example: "15.00" }
+        remaining_month: { type: string, example: "30.00" }
+        per_action_cap: { type: string, example: "12.00" }
+        approval_threshold: { type: string, example: "5.00" }
+    PurchaseRequest:
+      type: object
+      required: [requester, category, merchant, description, amount, reason]
+      properties:
+        requester: { type: string, enum: [user, agent, timeline], example: agent }
+        category: { type: string, enum: [subscription, api_call, compute, dataset], example: api_call }
+        merchant: { type: string, example: IndexedPapersAPI }
+        description: { type: string, example: "1 indexed academic text lookup" }
+        amount: { type: string, example: "0.05" }
+        currency: { type: string, default: USD, example: USD, description: Optional, USD only }
+        reason: { type: string, example: Needed one paper abstract to answer the user's question }
+        plan_step_id: { type: string, nullable: true, example: null }
+    PolicyDecision:
+      type: object
+      properties:
+        decision: { type: string, enum: [ALLOW, REQUIRE_APPROVAL, BLOCK], example: ALLOW }
+        rule: { type: string, enum: [per_action_cap, insufficient_funds, daily_cap, monthly_budget, approval_threshold, none], example: none }
+        reason: { type: string, example: Within all limits }
+    Transaction:
+      type: object
+      properties:
+        id: { type: string, example: txn_001 }
+        requester: { type: string, enum: [user, agent, timeline], example: agent }
+        category: { type: string, enum: [subscription, api_call, compute, dataset], example: api_call }
+        merchant: { type: string, example: IndexedPapersAPI }
+        description: { type: string, example: "1 indexed academic text lookup" }
+        reason: { type: string, example: Needed one paper abstract to answer the user's question }
+        amount: { type: string, example: "0.05" }
+        currency: { type: string, example: USD }
+        decision: { $ref: "#/components/schemas/PolicyDecision" }
+        status: { type: string, enum: [PENDING_APPROVAL, APPROVED, SETTLED, REJECTED, BLOCKED, FAILED], example: APPROVED }
+        settlement: { type: string, enum: [immediate, batched], example: batched }
+        paypal_ref: { type: string, nullable: true, example: null, description: PayPal payout batch id once settled }
+        batch_id: { type: string, nullable: true, example: null }
+        plan_step_id: { type: string, nullable: true, example: null }
+        created_at: { type: string, format: date-time, example: "2026-11-05T10:00:00Z" }
+    SettlementBatch:
+      type: object
+      properties:
+        batch_id: { type: string, example: bat_001 }
+        transaction_ids:
+          type: array
+          items: { type: string }
+          example: [txn_001, txn_002]
+        total: { type: string, example: "0.10" }
+        paypal_ref: { type: string, nullable: true, example: 5UXFAKE123 }
+        status: { type: string, enum: [SETTLED, FAILED], example: SETTLED }
+    Platform:
+      type: object
+      properties:
+        id: { type: string, example: streama }
+        name: { type: string, example: StreamA }
+        monthly_price: { type: string, example: "7.99" }
+        receiver_email: { type: string, nullable: true, example: null, description: Sandbox account paid by Payouts. If null the backend uses PAYOUT_RECEIVER_EMAIL. }
+        titles:
+          type: array
+          items:
+            type: object
+            properties:
+              title: { type: string, example: Series A }
+              type: { type: string, enum: [series, movie], example: series }
+              watch_hours: { type: number, example: 12 }
+    Merchant:
+      type: object
+      properties:
+        id: { type: string, example: indexedpapers }
+        name: { type: string, example: IndexedPapersAPI }
+        category: { type: string, enum: [api_call, compute, dataset], example: api_call }
+        typical_price: { type: string, example: "0.05" }
+        receiver_email: { type: string, nullable: true, example: null, description: If null the backend uses PAYOUT_RECEIVER_EMAIL. }
+    PlanStep:
+      type: object
+      properties:
+        id: { type: string, example: stp_001 }
+        month: { type: integer, example: 1 }
+        platform_id: { type: string, example: streama }
+        platform_name: { type: string, example: StreamA }
+        titles:
+          type: array
+          items: { type: string }
+          example: [Series A]
+        price: { type: string, example: "7.99" }
+        watch_hours: { type: number, example: 12 }
+        starts_on: { type: string, format: date, example: "2026-11-05" }
+        cancel_on: { type: string, format: date, example: "2026-12-04" }
+        status: { type: string, enum: [PLANNED, PENDING_APPROVAL, PAID, SKIPPED], example: PLANNED }
+        transaction_id: { type: string, nullable: true, example: null }
+    Plan:
+      type: object
+      properties:
+        id: { type: string, example: pln_001 }
+        titles:
+          type: array
+          items: { type: string }
+          example: [Series A, Series B, Movie C]
+        steps:
+          type: array
+          items: { $ref: "#/components/schemas/PlanStep" }
+        total_cost: { type: string, example: "18.97", description: Cost following the timeline (one month per step) }
+        all_at_once_cost: { type: string, example: "56.91", description: "Cost if every needed platform ran for every month of the plan (sum of monthly prices x number of months)" }
+        savings: { type: string, example: "37.94", description: all_at_once_cost minus total_cost }
+        explanation: { type: string, example: "Series A on StreamA in month 1, then StreamB in month 2..." }
+        created_at: { type: string, format: date-time, example: "2026-11-05T10:00:00Z" }
